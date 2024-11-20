@@ -13,6 +13,21 @@
                           symbol-description-table))
               result))))))
 
+;; TODO: try making indentation work properly in emacs later...
+(define-syntax match-list
+  (syntax-rules ()
+    ((_ e (h . t) body1 body2 ...)
+     (let* ((tmp e)
+            (h (car tmp)))
+       (match-list (cdr tmp) t body1 body2 ...)))
+    ((_ e () body1 body2 ...)
+     (if (null? e)
+         (begin body1 body2 ...)
+         (error 'match-list "bad list")))
+    ((_ e name body1 body2 ...)
+     (let ((name e))
+       body1 body2 ...))))
+
 ;;; --- relatively portable assembly
 ;;; values are machine words or floating point numbers
 ;;; (name attributes args
@@ -25,7 +40,7 @@
     (copy int int)
     (copy-label int label)
     (call int int . int)
-    (c-call int int . int)         ; distinction needed on targets whose abi sucks
+    (c-call int int . int) ; distinction needed on targets whose abi sucks
     (tail-call int . int)
     (syscall int . int)
     (+ int int int) (- int int int) (* int int int) (/ int int int)
@@ -379,7 +394,7 @@
 
 ;;; assembly
 
-;;; local variables on the stack are addressed relative to the frame pointer
+;; local variables on the stack are addressed relative to the frame pointer
 
 ;;; object file
 
