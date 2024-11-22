@@ -13,6 +13,10 @@
                           symbol-description-table))
               result))))))
 
+(define comp
+  (lambda (f g)
+    (lambda (x) (f (g x)))))
+
 ;; TODO: try making indentation work properly in emacs later...
 (define-syntax match-list
   (syntax-rules ()
@@ -32,7 +36,7 @@
 ;;; values are machine words or floating point numbers
 ;;; (name attributes args
 ;;;   body ...)
-;;; attributes: list, might contain c-abi
+;;; attributes: alist, might contain (c-abi)
 ;;;   or (types . <alist of types>) after typechecking
 (define rpasm-statement-generation
   '((ldi int number)
@@ -58,8 +62,9 @@
     (goto-if (rel . data) label)))
 ;;; rel ::= eq | const-true | lt | ult | flt
 
+;; this function will probably have the special-casing for goto-ifs forever
 (define infer-types
-  (lambda (stmt)
+  (lambda (stmt gen-table)
     (let ((h (car stmt))
           (t (cdr stmt)))
       (cond ((eq? h 'goto-if)
@@ -84,7 +89,7 @@
                                        (cons var spec))
                                      args))
                                (else '())))))
-               (let* ((generation (assq h rpasm-statement-generation))
+               (let* ((generation (assq h gen-table))
                       (arg-spec (cdr generation)))
                  (match-types arg-spec t))))))))
 
@@ -119,32 +124,49 @@
 (define dedupa
   (lambda (alist)
     (map (lambda (var)
-           (cons var (cdr (assq var alist))))
+           (assq var alist))
          (dedupq (map car alist)))))
 
 ;; typecheck the statements
-(define rpasm-typecheck
-  (lambda (blk)
+(define asm-typecheck
+  (lambda (blk gen-table)
     (let* ((name (car blk))
            (attr (cadr blk))
            (args (caddr blk))
            (body (cdddr blk))
            (types (filter (lambda (decl)
-                            (memq (cdr decl) '(int float)))
+                            (memq (cdr decl) '(int float))) ; labels, immediates
                           (append (map (lambda (var)
                                          (cons var 'int))
                                        args)
                                   (apply append
-                                         (map infer-types body))))))
-      (if (not (alist-coherent? types)) (error 'rpasm "types bad"))
+                                         (map (lambda (stmt) (infer-types stmt gen-table))
+                                              body))))))
+      (if (not (alist-coherent? types)) (error 'asm-typecheck "types bad"))
       `(,name ,(cons (cons 'types (dedupa types)) attr) ,args
               ,@body))))
+
+(define rpasm-typecheck
+  (lambda (blk) (asm-typecheck blk rpasm-statement-generation)))
 
 ;;; --- wishful thinking assembly
 ;;; like relatively portable assembly, but attributes can contain
 ;;;   (must var reg), statements become (call var), (c-call var), (syscall),
-;;;   (make-alive var), (c-return), (return)
+;;;   (make-alive var), (c-return), (return), (load-arg var number), (prologue)
 ;;; basically, everything needed for register allocation
+
+(define wtasm-statement-generation
+  (append '((call int)
+            (c-call int)
+            (syscall)
+            (make-alive any)
+            (c-return)
+            (return)
+            (load-arg int number)
+            (prologue))
+          rpasm-statement-generation))
+(define wtasm-typecheck
+  (lambda (blk) (asm-typecheck blk wtasm-statement-generation)))
 
 ;;; amd64-sysv specific: output needs sse and bmi2 (for shlx and friends)
 ;;;   the abi sucks so we use our own except when interfacing with external code
@@ -170,6 +192,8 @@
 ;;; --- [rsp]
 
 (define amd64-gpreg '(rax rbx rcx rdx rsp rbp rsi rdi r8 r9 r10 r11 r12 r13 r14 r15))
+(define amd64-fpreg '(xmm0 xmm1 xmm2 xmm3 xmm4 xmm5 xmm6 xmm7
+                      xmm8 xmm9 xmm10 xmm11 xmm12 xmm13 xmm14 xmm15))
 (define amd64-sysv-regargs '(rdi rsi rdx rcx r8 r9))
 (define amd64-sysv-result 'rax)
 (define amd64-sysv-callee-saved '(rbx r12 r13 r14 r15))
@@ -198,6 +222,8 @@
 (define make-copy (listc 'copy))
 (define make-must (listc 'must))
 
+;; TODO: abstract some stuff out, though the details are very different
+;;   so maybe i can't (also not many targets right now)
 (define amd64-sysv-call
   (lambda (stmt blk)
     (let* ((dest (cadr stmt))
@@ -347,9 +373,31 @@
     (let* ((res (cadr stmt))
            (res-name (newname 'result))
            (code `((copy ,res-name ,res)
-                   (return ,res-name)))
+                   (return)))
            (attr `((must ,res-name ,amd64-result))))
       (values attr code))))
+
+(define amd64-sysv-prologue
+  (lambda (stmt blk)
+    (let* ((args (caddr blk))
+           (reg-args (list-take args (length amd64-sysv-regargs)))
+           (stack-args (list-drop args (length amd64-sysv-regargs)))
+           (reg-names (map (lambda (var) (newname 'reg)) reg-args))
+           (reg-code (map make-copy reg-args reg-names))
+           (reg-attr (map make-must reg-names (list-take amd64-sysv-regargs (length reg-args))))
+           (stack-code (map (listc 'load-arg) stack-args (iota (length stack-args)))))
+      (values reg-attr (append reg-code stack-code)))))
+
+(define amd64-prologue
+  (lambda (stmt blk)
+    (let* ((args (caddr blk))
+           (reg-args (list-take args (length amd64-regargs)))
+           (stack-args (list-drop args (length amd64-regargs)))
+           (reg-names (map (lambda (var) (newname 'reg)) reg-args))
+           (reg-code (map make-copy reg-args reg-names))
+           (reg-attr (map make-must reg-names (list-take amd64-sysv-regargs (length reg-args))))
+           (stack-code (map (listc 'load-arg) stack-args (iota (length stack-args)))))
+      (values reg-attr (append reg-code stack-code)))))
 
 (define rpasm->amd64-linux-wtasm
   (lambda (blk)
@@ -357,23 +405,20 @@
            (attr (cadr blk))
            (args (caddr blk))
            (body (cdddr blk))
-           (c-abi (memq 'c-abi attr)))
+           (c-abi (memq 'c-abi attr))
+           (abi-proc-table `((call . ,amd64-call)
+                             (c-call . ,amd64-sysv-call)
+                             ,@(if c-abi '() `((tail-call . ,amd64-tail-call)))
+                             (syscall . ,amd64-linux-syscall)
+                             (return . ,(if c-abi amd64-sysv-return amd64-return))
+                             (prologue . ,(if c-abi amd64-sysv-prologue amd64-prologue)))))
       (letrec ((iter
                 (lambda (body attr-acc body-acc)
                   (if (null? body)
                       `(,name ,attr-acc ,args ,@(reverse body-acc))
                       (let* ((cur (car body))
                              (rest (cdr body))
-                             (abi-proc (assq (car cur)
-                                             `((call . ,amd64-call)
-                                               (c-call . ,amd64-sysv-call)
-                                               ,@(if c-abi
-                                                     '()
-                                                     `((tail-call . ,amd64-tail-call)))
-                                               (syscall . ,amd64-linux-syscall)
-                                               (return . ,(if c-abi
-                                                              amd64-sysv-return
-                                                              amd64-return))))))
+                             (abi-proc (assq (car cur) abi-proc-table)))
                         (if abi-proc
                             (let-values (((new-attr new-body)
                                           ((cdr abi-proc) cur blk)))
@@ -383,7 +428,8 @@
                             (iter rest
                                   attr-acc
                                   (cons cur body-acc))))))))
-        (iter body
+        (iter `((prologue)
+                ,@body)
               (append attr '((must tmp0 r10)
                              (must tmp1 r11)
                              (must sp rsp)
