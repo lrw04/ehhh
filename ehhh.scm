@@ -36,7 +36,7 @@
 ;;; values are machine words or floating point numbers
 ;;; (name attributes args
 ;;;   body ...)
-;;; attributes: alist, might contain (c-abi)
+;;; attributes: alist, might contain c-abi
 ;;;   or (types . <alist of types>) after typechecking
 (define rpasm-statement-generation
   '((ldi int number)
